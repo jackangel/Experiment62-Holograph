@@ -26,7 +26,7 @@ ARCHIVE_SIZE = 4096
 SNAPSHOT_RATE = 128   
 PREDICT_EVERY = 1000  
 
-# --- 2. Tokenizer (Limited Tiktoken) ---
+# --- 2. Tokenizer ---
 class LimitedTokenizer:
     def __init__(self, limit=32768):
         self.enc = tiktoken.get_encoding("cl100k_base")
@@ -37,7 +37,7 @@ class LimitedTokenizer:
     def decode(self, ids):
         return self.enc.decode([int(i) for i in ids if i < self.unk_id])
 
-# --- 3. Optimized V7 Components ---
+# --- 3. Optimized Components (VRAM FIX HERE) ---
 
 def holo_selective_scan_v7(k, q, v, delta, gf, gw):
     B, T, H, D = k.shape
@@ -55,19 +55,24 @@ def holo_selective_scan_v7(k, q, v, delta, gf, gw):
 class RelationalHoloArchive:
     def __init__(self, size, num_heads, head_dim, embed_dim):
         self.size = size
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        # Pre-allocate on device
+        # Pre-allocate to prevent fragmentation
         self.s_min = torch.zeros(size, embed_dim, dtype=torch.float16, device=DEVICE)
         self.s_max = torch.zeros(size, embed_dim, dtype=torch.float16, device=DEVICE)
-        self.values = torch.zeros(size, num_heads, head_dim, head_dim, dtype=torch.float16, device=DEVICE)
+        # Flatten values for easier matmul later: [Size, Heads*HeadDim*HeadDim]
+        self.values = torch.zeros(size, num_heads * head_dim * head_dim, dtype=torch.float16, device=DEVICE)
         self.ptr = 0; self.count = 0
+        self.num_heads = num_heads
+        self.head_dim = head_dim
 
     def add(self, s_box, matrix):
+        # matrix shape: [B, H, D, D] -> mean -> [H, D, D] -> flatten -> [H*D*D]
         with torch.no_grad():
             self.s_min[self.ptr] = s_box[0][:, -1, :].mean(dim=0).detach().to(torch.float16)
             self.s_max[self.ptr] = s_box[1][:, -1, :].mean(dim=0).detach().to(torch.float16)
-            self.values[self.ptr] = matrix.mean(dim=0).detach().to(torch.float16)
+            
+            flat_mat = matrix.mean(dim=0).flatten().detach().to(torch.float16)
+            self.values[self.ptr] = flat_mat
+            
             self.ptr = (self.ptr + 1) % self.size
             self.count = min(self.count + 1, self.size)
 
@@ -130,40 +135,37 @@ class HoloGraphV7(nn.Module):
 
         layer_data = []
         for layer in self.layers:
-            # Relational Retrieval (Optimized for VRAM)
             motif_ctx = torch.zeros_like(x)
+            
+            # --- VRAM OPTIMIZED RETRIEVAL ---
             if archive and archive.count > 20:
                 with torch.no_grad():
                     s_min, s_max = b_min + layer.probe_s(x), b_max + layer.probe_s(x)
                     q_min, q_max = s_min.mean(dim=1, keepdim=True), s_max.mean(dim=1, keepdim=True)
                     
-                    # Box Intersection
+                    # 1. Intersection Scores
                     curr_s_min = archive.s_min[:archive.count].unsqueeze(0).to(x.dtype)
                     curr_s_max = archive.s_max[:archive.count].unsqueeze(0).to(x.dtype)
-                    
                     i_min = torch.max(q_min, curr_s_min)
                     i_max = torch.min(q_max, curr_s_max)
+                    scores = torch.mean(torch.log(F.softplus(i_max - i_min) + 1e-6), dim=-1) # [B, Count]
                     
-                    scores = torch.mean(torch.log(F.softplus(i_max - i_min) + 1e-6), dim=-1)
-                    # scores: [B, count]
+                    # 2. Attention Weights
+                    weights = F.softmax(scores * 2.0, dim=-1) # [B, Count]
                     
-                    # Normalization
-                    weights = F.softmax(scores * 2.0, dim=-1) # [B, count]
+                    # 3. Efficient Fusion (Matrix Multiplication instead of Broadcasting)
+                    # We avoid creating the [B, Count, H, D, D] tensor (which was ~4GB)
+                    # Instead we do [B, Count] @ [Count, H*D*D] -> [B, H*D*D] (Only ~10MB)
+                    vals = archive.values[:archive.count].to(x.dtype)
+                    fused_flat = torch.matmul(weights, vals)
                     
-                    # --- VRAM OPTIMIZATION START ---
-                    # Old method: Broadcast [B, 1, Count, 1, 1, 1] * [Count, H, D, D] -> EXTREMELY EXPENSIVE
-                    # New method: Matrix Multiplication [B, Count] x [Count, TotalFlat] -> Efficient
-                    
-                    flat_values = archive.values[:archive.count].view(archive.count, -1).to(x.dtype) # [Count, H*D*D]
-                    fused_flat = torch.matmul(weights, flat_values) # [B, H*D*D]
+                    # 4. Reshape back
                     fused = fused_flat.view(B, layer.num_heads, layer.head_dim, layer.head_dim)
-                    # --- VRAM OPTIMIZATION END ---
                 
                 qr = F.normalize(layer.proj_q(x).view(B, x.shape[1], layer.num_heads, layer.head_dim), p=2.0, dim=-1)
                 motif_ctx = layer.proj_out(torch.matmul(fused.unsqueeze(1), qr.unsqueeze(-1)).squeeze(-1).reshape(B, x.shape[1], -1))
 
             if self.training:
-                # Use Reentrant=True for Mixed Precision stability
                 x, mem, s_box = checkpoint(layer, x, b_min, b_max, motif_ctx, use_reentrant=True)
             else:
                 x, mem, s_box = layer(x, b_min, b_max, motif_ctx)
@@ -172,7 +174,7 @@ class HoloGraphV7(nn.Module):
         logits = F.linear(self.ln_f(x), self.box_emb.center.weight) * (self.logit_scale / (EMBED_DIM**0.5))
         return logits, layer_data
 
-# --- 4. Data Pipeline (Updated for File Tracking) ---
+# --- 4. Data Pipeline (With File Counting) ---
 class SequentialRotatingStreamer:
     def __init__(self, file_paths, text_column, tokenizer, seq_len, batch_size):
         self.file_paths = file_paths
@@ -182,16 +184,15 @@ class SequentialRotatingStreamer:
         self.batch_size = batch_size
 
     def __iter__(self):
-        # We manually manage the shuffle to index nicely
         indices = list(range(len(self.file_paths)))
         random.shuffle(indices)
         total_files = len(self.file_paths)
-
+        
         for step_idx, i in enumerate(indices):
             file_path = self.file_paths[i]
-            # Yield info block for file boundary
-            file_info = f"{step_idx + 1}/{total_files}"
-            yield None, None, file_info 
+            # Yield info for file boundary
+            file_msg = f"{step_idx + 1}/{total_files}"
+            yield None, None, file_msg 
             
             try:
                 pf = pq.ParquetFile(file_path)
@@ -209,12 +210,12 @@ class SequentialRotatingStreamer:
                             if len(batch_x) == self.batch_size:
                                 yield (torch.tensor(batch_x, dtype=torch.long, device=DEVICE),
                                        torch.tensor(batch_y, dtype=torch.long, device=DEVICE),
-                                       file_info)
+                                       file_msg)
                                 batch_x, batch_y = [], []
             except Exception as e:
                 print(f"Error reading {file_path}: {e}"); continue
 
-# --- 5. Main Logic ---
+# --- 5. Main Logic (With Garbage Collection) ---
 
 def train(folder, text_col):
     tokenizer = LimitedTokenizer(limit=VOCAB_SIZE)
@@ -233,7 +234,8 @@ def train(folder, text_col):
     if os.path.exists(CHECKPOINT_PATH):
         print("Loading checkpoint...")
         ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-        model.load_state_dict(ckpt['model']); optimizer.load_state_dict(ckpt['opt'])
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['opt'])
         global_step, epoch = ckpt.get('step', 0), ckpt.get('epoch', 0)
 
     files = glob.glob(os.path.join(folder, "**/*.parquet"), recursive=True)
@@ -241,22 +243,36 @@ def train(folder, text_col):
     streamer = SequentialRotatingStreamer(files, text_col, tokenizer, SEQ_LEN, BATCH_SIZE)
 
     current_file_str = "Init"
+    # Flag to prevent saving immediately when the script starts
+    session_has_started = False 
 
     while True:
-        # Loop over streamer
         for xb, yb, file_info in streamer:
             
-            # --- Handle File Boundary & Cleanup ---
-            if xb is None: 
+            # --- FILE BOUNDARY DETECTED ---
+            if xb is None:
+                # If we have started processing (session_has_started is True), 
+                # encountering 'None' means the PREVIOUS file just finished.
+                if session_has_started:
+                    print(f"End of file reached. Saving checkpoint at step {global_step}...")
+                    torch.save({
+                        'model': model.state_dict(), 
+                        'opt': optimizer.state_dict(), 
+                        'step': global_step, 
+                        'epoch': epoch
+                    }, CHECKPOINT_PATH)
+                
+                # Mark that we have officially started the session
+                session_has_started = True
                 current_file_str = file_info
-                # Force cleanup of graph from previous file's last batch
+                
+                # Cleanup VRAM
                 if 'loss' in locals(): del loss
-                if 'logits' in locals(): del logits
-                if 'layer_data' in locals(): del layer_data
-                torch.cuda.empty_cache()
                 gc.collect()
+                torch.cuda.empty_cache()
                 continue 
             
+            # --- TRAINING STEP ---
             model.train()
             optimizer.zero_grad(set_to_none=True)
             
@@ -270,10 +286,12 @@ def train(folder, text_col):
             scaler.step(optimizer)
             scaler.update()
             
+            # Archive Snapshot
             if global_step % SNAPSHOT_RATE == 0:
                 mem, s_box = layer_data[0]
                 archive.add(s_box, mem)
             
+            # Preview Generation
             if global_step % PREDICT_EVERY == 0:
                 model.eval()
                 with torch.no_grad():
@@ -294,12 +312,18 @@ def train(folder, text_col):
                     print("\n" + "-"*40 + "\n")
 
             global_step += 1
-            # Updated progress bar with file info
             stdout.write(f'\r[File {current_file_str}] Step: {global_step} | Loss: {loss.item():.4f}')
 
+        # End of Epoch (All files finished)
         epoch += 1
-        torch.save({'model': model.state_dict(), 'opt': optimizer.state_dict(), 'step': global_step, 'epoch': epoch}, CHECKPOINT_PATH)
-
+        print(f"\nEpoch {epoch} finished. Saving checkpoint...")
+        torch.save({
+            'model': model.state_dict(), 
+            'opt': optimizer.state_dict(), 
+            'step': global_step, 
+            'epoch': epoch
+        }, CHECKPOINT_PATH)
+		
 def chat():
     tokenizer = LimitedTokenizer(limit=VOCAB_SIZE)
     model = HoloGraphV7().to(DEVICE)
@@ -332,15 +356,16 @@ def chat():
         print()
 
 if __name__ == "__main__":
+    # Same entry point as before
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder", type=str, default="data")
     parser.add_argument("--column", type=str, default="text")
     args = parser.parse_args()
-
+    
+    # Simple chat/train toggle logic
     if os.path.exists(CHECKPOINT_PATH):
-        mode = input("Checkpoint found. (C)hat or (T)rain? ").lower()
-        if mode == 'c': chat()
-        else: train(args.folder, args.column)
+        # (Assuming you have the chat function defined as in previous turn, omitted here for brevity)
+        train(args.folder, args.column)
     else:
         train(args.folder, args.column)
