@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.checkpoint import checkpoint
-import os, glob, random, math
+import os, glob, random, math, gc
 import pyarrow.parquet as pq
 import tiktoken
 from tqdm import tqdm
@@ -41,16 +41,13 @@ class LimitedTokenizer:
 
 def holo_selective_scan_v7(k, q, v, delta, gf, gw):
     B, T, H, D = k.shape
-    # Gating and Updates
     v_gated = v * (delta * gw).unsqueeze(-1)
     updates = torch.matmul(v_gated.unsqueeze(-1), k.unsqueeze(-2))
     
-    # Log-space stability
     decay = (delta * gf).clamp(min=1e-6, max=0.999)
     log_decay = torch.log(decay).unsqueeze(-1).unsqueeze(-1)
     exp_cum_decay = torch.exp(torch.cumsum(log_decay, dim=1))
     
-    # Parallel Scan
     state = torch.cumsum(updates / (exp_cum_decay + 1e-8), dim=1) * exp_cum_decay
     readout = torch.matmul(state, q.unsqueeze(-1)).squeeze(-1)
     return readout, state[:, -1]
@@ -58,6 +55,9 @@ def holo_selective_scan_v7(k, q, v, delta, gf, gw):
 class RelationalHoloArchive:
     def __init__(self, size, num_heads, head_dim, embed_dim):
         self.size = size
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        # Pre-allocate on device
         self.s_min = torch.zeros(size, embed_dim, dtype=torch.float16, device=DEVICE)
         self.s_max = torch.zeros(size, embed_dim, dtype=torch.float16, device=DEVICE)
         self.values = torch.zeros(size, num_heads, head_dim, head_dim, dtype=torch.float16, device=DEVICE)
@@ -126,23 +126,41 @@ class HoloGraphV7(nn.Module):
     def forward(self, idx, archive=None):
         b_min, b_max = self.box_emb(idx)
         x = (b_min + b_max) / 2.0 
-        
+        B = x.shape[0]
+
         layer_data = []
         for layer in self.layers:
-            # Relational Retrieval (Outside Checkpoint for stability)
+            # Relational Retrieval (Optimized for VRAM)
             motif_ctx = torch.zeros_like(x)
             if archive and archive.count > 20:
                 with torch.no_grad():
                     s_min, s_max = b_min + layer.probe_s(x), b_max + layer.probe_s(x)
                     q_min, q_max = s_min.mean(dim=1, keepdim=True), s_max.mean(dim=1, keepdim=True)
-                    i_min = torch.max(q_min, archive.s_min[:archive.count].unsqueeze(0).to(x.dtype))
-                    i_max = torch.min(q_max, archive.s_max[:archive.count].unsqueeze(0).to(x.dtype))
+                    
+                    # Box Intersection
+                    curr_s_min = archive.s_min[:archive.count].unsqueeze(0).to(x.dtype)
+                    curr_s_max = archive.s_max[:archive.count].unsqueeze(0).to(x.dtype)
+                    
+                    i_min = torch.max(q_min, curr_s_min)
+                    i_max = torch.min(q_max, curr_s_max)
+                    
                     scores = torch.mean(torch.log(F.softplus(i_max - i_min) + 1e-6), dim=-1)
-                    w = F.softmax(scores * 2.0, dim=-1).view(x.shape[0], 1, archive.count, 1, 1, 1)
-                    fused = torch.sum(w * archive.values[:archive.count].to(x.dtype), dim=2)
+                    # scores: [B, count]
+                    
+                    # Normalization
+                    weights = F.softmax(scores * 2.0, dim=-1) # [B, count]
+                    
+                    # --- VRAM OPTIMIZATION START ---
+                    # Old method: Broadcast [B, 1, Count, 1, 1, 1] * [Count, H, D, D] -> EXTREMELY EXPENSIVE
+                    # New method: Matrix Multiplication [B, Count] x [Count, TotalFlat] -> Efficient
+                    
+                    flat_values = archive.values[:archive.count].view(archive.count, -1).to(x.dtype) # [Count, H*D*D]
+                    fused_flat = torch.matmul(weights, flat_values) # [B, H*D*D]
+                    fused = fused_flat.view(B, layer.num_heads, layer.head_dim, layer.head_dim)
+                    # --- VRAM OPTIMIZATION END ---
                 
-                qr = F.normalize(layer.proj_q(x).view(x.shape[0], x.shape[1], layer.num_heads, layer.head_dim), p=2.0, dim=-1)
-                motif_ctx = layer.proj_out(torch.matmul(fused, qr.unsqueeze(-1)).squeeze(-1).reshape(x.shape[0], x.shape[1], -1))
+                qr = F.normalize(layer.proj_q(x).view(B, x.shape[1], layer.num_heads, layer.head_dim), p=2.0, dim=-1)
+                motif_ctx = layer.proj_out(torch.matmul(fused.unsqueeze(1), qr.unsqueeze(-1)).squeeze(-1).reshape(B, x.shape[1], -1))
 
             if self.training:
                 # Use Reentrant=True for Mixed Precision stability
@@ -154,7 +172,7 @@ class HoloGraphV7(nn.Module):
         logits = F.linear(self.ln_f(x), self.box_emb.center.weight) * (self.logit_scale / (EMBED_DIM**0.5))
         return logits, layer_data
 
-# --- 4. Data Pipeline ---
+# --- 4. Data Pipeline (Updated for File Tracking) ---
 class SequentialRotatingStreamer:
     def __init__(self, file_paths, text_column, tokenizer, seq_len, batch_size):
         self.file_paths = file_paths
@@ -164,14 +182,22 @@ class SequentialRotatingStreamer:
         self.batch_size = batch_size
 
     def __iter__(self):
-        random.shuffle(self.file_paths)
-        for file_path in self.file_paths:
-            yield None, None, file_path 
+        # We manually manage the shuffle to index nicely
+        indices = list(range(len(self.file_paths)))
+        random.shuffle(indices)
+        total_files = len(self.file_paths)
+
+        for step_idx, i in enumerate(indices):
+            file_path = self.file_paths[i]
+            # Yield info block for file boundary
+            file_info = f"{step_idx + 1}/{total_files}"
+            yield None, None, file_info 
+            
             try:
                 pf = pq.ParquetFile(file_path)
                 batch_x, batch_y = [], []
-                for i in range(pf.num_row_groups):
-                    table = pf.read_row_group(i, columns=[self.text_column])
+                for r in range(pf.num_row_groups):
+                    table = pf.read_row_group(r, columns=[self.text_column])
                     texts = table.column(self.text_column).to_pylist()
                     token_buffer = []
                     for text in texts:
@@ -183,7 +209,7 @@ class SequentialRotatingStreamer:
                             if len(batch_x) == self.batch_size:
                                 yield (torch.tensor(batch_x, dtype=torch.long, device=DEVICE),
                                        torch.tensor(batch_y, dtype=torch.long, device=DEVICE),
-                                       file_path)
+                                       file_info)
                                 batch_x, batch_y = [], []
             except Exception as e:
                 print(f"Error reading {file_path}: {e}"); continue
@@ -195,7 +221,6 @@ def train(folder, text_col):
     model = HoloGraphV7().to(DEVICE)
     archive = RelationalHoloArchive(ARCHIVE_SIZE, NUM_HEADS, HEAD_DIM, EMBED_DIM)
     
-    # 8-bit Optimizer setup
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
@@ -215,9 +240,22 @@ def train(folder, text_col):
     if not files: print(f"No parquet files found in {folder}!"); return
     streamer = SequentialRotatingStreamer(files, text_col, tokenizer, SEQ_LEN, BATCH_SIZE)
 
+    current_file_str = "Init"
+
     while True:
-        for xb, yb, current_file in streamer:
-            if xb is None: continue # Skip file-boundary markers
+        # Loop over streamer
+        for xb, yb, file_info in streamer:
+            
+            # --- Handle File Boundary & Cleanup ---
+            if xb is None: 
+                current_file_str = file_info
+                # Force cleanup of graph from previous file's last batch
+                if 'loss' in locals(): del loss
+                if 'logits' in locals(): del logits
+                if 'layer_data' in locals(): del layer_data
+                torch.cuda.empty_cache()
+                gc.collect()
+                continue 
             
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -232,37 +270,32 @@ def train(folder, text_col):
             scaler.step(optimizer)
             scaler.update()
             
-            # Archive Snapshot logic
             if global_step % SNAPSHOT_RATE == 0:
                 mem, s_box = layer_data[0]
                 archive.add(s_box, mem)
             
-            # Periodic Prediction (Improved to show 20 tokens)
             if global_step % PREDICT_EVERY == 0:
                 model.eval()
                 with torch.no_grad():
-                    # Take the first 10 tokens of the current batch as a prompt
                     context = xb[:1, :10] 
-                    print(f"\n\n--- Step {global_step} Generation Preview ---")
+                    print(f"\n\n--- Step {global_step} [File {current_file_str}] Generation Preview ---")
                     print(f"Prompt: {tokenizer.decode(context[0].tolist())}")
                     print("Output: ", end="", flush=True)
                     
                     gen_tokens = context
-                    for _ in range(20): # Predict 20 tokens instead of 1
+                    for _ in range(20): 
                         with torch.cuda.amp.autocast():
                             lg, _ = model(gen_tokens, archive=archive)
-                        
-                        # Use sampling instead of argmax for better variety
                         probs = F.softmax(lg[:, -1, :] / 0.8, dim=-1)
                         next_token = torch.multinomial(probs, 1)
-                        
                         print(tokenizer.decode([next_token.item()]), end="", flush=True)
                         gen_tokens = torch.cat([gen_tokens, next_token], dim=1)
                         if gen_tokens.shape[1] > SEQ_LEN: gen_tokens = gen_tokens[:, 1:]
                     print("\n" + "-"*40 + "\n")
 
             global_step += 1
-            stdout.write(f'\rStep: {global_step} | Loss: {loss.item():.4f}')
+            # Updated progress bar with file info
+            stdout.write(f'\r[File {current_file_str}] Step: {global_step} | Loss: {loss.item():.4f}')
 
         epoch += 1
         torch.save({'model': model.state_dict(), 'opt': optimizer.state_dict(), 'step': global_step, 'epoch': epoch}, CHECKPOINT_PATH)
